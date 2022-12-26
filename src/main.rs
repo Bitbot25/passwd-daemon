@@ -1,5 +1,6 @@
 #![feature(ptr_metadata)]
 
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::marker::PhantomData;
@@ -116,169 +117,208 @@ impl PublicPacketHeader {
     }
 }
 
-enum CopyMode {
-    Username,
-    Password
+enum EntryMenu {
+    CopyUsername,
+    CopyPassword
 }
 
-fn run_rofi(key_data: &mut MasterKeyData) {
-    // TODO: Replace all panics with returns and log to stderr.
-    let passwd = match &key_data.key {
-        Some(passwd) => {
-            key_data.last_use = Instant::now();
-            String::from(passwd.as_ref())
-        }
-        None => {
-            let rofi_enter_passwd = Command::new("/usr/bin/rofi")
-                .arg("-dmenu")
-                .arg("-password")
-                .args(&["-p", "Password"])
-                .output()
-                .expect("failed to spawn child process");
-            let exit_code = rofi_enter_passwd
-                .status
-                .code()
-                .expect("failed to acquire exit code.");
-
-            if exit_code != 0 {
-                if exit_code != 1 {
-                    eprintln!("[WARN] Rofi exited with status code {}", exit_code);
+fn run_rofi(key_data: &mut MasterKeyData, last_entry: &mut Option<LastOpenEntry>) {
+    fn open_entry_list_menu(key_data: &mut MasterKeyData, last_entry: &mut Option<LastOpenEntry>, passwd: &str) {
+        println!("open_entry_list_menu");
+        let password_entry_name: String = match last_entry {
+            Some(LastOpenEntry { time,  name }) if time.elapsed() < Duration::from_secs(ARGS.open_last_timeout) => {
+                *time = Instant::now();
+                name.clone()
+            }
+            _ => {
+                let mut keepassxc_entries_cmd = Command::new("/usr/bin/keepassxc-cli")
+                    .arg("ls")
+                    .arg(&*ARGS.database)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("failed to spawn child process");
+                keepassxc_entries_cmd
+                    .stdin
+                    .as_mut()
+                    .expect("couldn't write to stdin of child process")
+                    .write_all(passwd.as_bytes())
+                    .expect("couldn't write to stdin of child process");
+                let keepassxc_entries_exit_code = keepassxc_entries_cmd
+                    .wait()
+                    .expect("failed to start keepasscx-cli")
+                    .code()
+                    .expect("failed to acquire exit code.");
+                if keepassxc_entries_exit_code != 0 {
+                    eprintln!(
+                        "[ERR] keepassxc-cli exited with status code {}",
+                        keepassxc_entries_exit_code
+                    );
+                    return;
                 }
-                return;
+
+                let mut keepassxc_entries_stdout = keepassxc_entries_cmd.stdout.expect("couldn't read stdout of child process");
+                let mut keepassxc_entries = String::new();
+                keepassxc_entries_stdout.read_to_string(&mut keepassxc_entries).expect("couldn't read stdout of child process");
+
+                let mut rofi_entries_proc = Command::new("/usr/bin/rofi")
+                        .arg("-dmenu")
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("failed to spawn child process");
+
+                let rofi_entries_proc_stdin = rofi_entries_proc.stdin.as_mut().expect("couldn't write to stdin of child process");
+                rofi_entries_proc_stdin.write_all(keepassxc_entries.as_bytes()).expect("couldn't write to stdin of child process");
+                let rofi_entries_proc_exit_code = rofi_entries_proc.wait().expect("failed to start child process").code().expect("failed to acquire exit code");
+                if rofi_entries_proc_exit_code != 0 {
+                    if rofi_entries_proc_exit_code != 1 {
+                        eprintln!("[WARN] Rofi exited with status code {}", rofi_entries_proc_exit_code);
+                    }
+                    return;
+                }
+                let mut rofi_entries_proc_stdout = rofi_entries_proc.stdout.expect("couldn't read stdout of child process");
+                let mut password_entry_name = String::new();
+                rofi_entries_proc_stdout.read_to_string(&mut password_entry_name).expect("couldn't read stdout of child process");
+                // Remove leading newline
+                password_entry_name.pop();
+                *last_entry = Some(LastOpenEntry { name: password_entry_name.clone(), time: Instant::now() });
+                password_entry_name
             }
+        };
 
-            let str: &str = &*String::from_utf8_lossy(rofi_enter_passwd.stdout.as_slice());
-            key_data.last_use = Instant::now();
-            unsafe {
-                key_data.key = Some(ProtectedBox::new_from_ref_copy(str));
-                mem::forget(str);
+        open_entry_menu(key_data, last_entry, &*password_entry_name, passwd);
+        println!("return open_entry_list_menu");
+    }
+
+
+    fn open_entry_menu(key_data: &mut MasterKeyData, last_entry: &mut Option<LastOpenEntry>, entry_name: &str, passwd: &str) {
+        println!("open_entry_menu");
+        let mut rofi_copy_mode_proc = Command::new("/usr/bin/rofi")
+                .arg("-dmenu")
+                .arg("-p")
+                .arg(entry_name)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn child process");
+        let rofi_copy_mode_stdin = rofi_copy_mode_proc.stdin.as_mut().expect("couldn't write to stdin of child process");
+        rofi_copy_mode_stdin.write_all(b"Copy username\nCopy password\nGo back").expect("couldn't write to stdin of child process");
+        let rofi_copy_mode_exit_code = rofi_copy_mode_proc.wait().expect("failed to spawn child process").code().expect("failed to acquire exit code");
+
+        if rofi_copy_mode_exit_code != 0 {
+            if rofi_copy_mode_exit_code != 1 {
+                eprintln!("[WARN] Rofi exited with status code {}", rofi_copy_mode_exit_code);
             }
-            String::from(str)
-        }
-    };
-
-    let mut keepassxc_entries_cmd = Command::new("/usr/bin/keepassxc-cli")
-        .arg("ls")
-        .arg(&*ARGS.database)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn child process");
-    keepassxc_entries_cmd
-        .stdin
-        .as_mut()
-        .expect("couldn't write to stdin of child process")
-        .write_all(passwd.as_bytes())
-        .expect("couldn't write to stdin of child process");
-    let keepassxc_entries_exit_code = keepassxc_entries_cmd
-        .wait()
-        .expect("failed to start keepasscx-cli")
-        .code()
-        .expect("failed to acquire exit code.");
-    if keepassxc_entries_exit_code != 0 {
-        eprintln!(
-            "[ERR] keepassxc-cli exited with status code {}",
-            keepassxc_entries_exit_code
-        );
-        return;
-    }
-
-    let mut keepassxc_entries_stdout = keepassxc_entries_cmd.stdout.expect("couldn't read stdout of child process");
-    let mut keepassxc_entries = String::new();
-    keepassxc_entries_stdout.read_to_string(&mut keepassxc_entries).expect("couldn't read stdout of child process");
-
-    let mut rofi_entries_proc = Command::new("/usr/bin/rofi")
-            .arg("-dmenu")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn child process");
-
-    let rofi_entries_proc_stdin = rofi_entries_proc.stdin.as_mut().expect("couldn't write to stdin of child process");
-    rofi_entries_proc_stdin.write_all(keepassxc_entries.as_bytes()).expect("couldn't write to stdin of child process");
-    let rofi_entries_proc_exit_code = rofi_entries_proc.wait().expect("failed to start child process").code().expect("failed to acquire exit code");
-    if rofi_entries_proc_exit_code != 0 {
-        if rofi_entries_proc_exit_code != 1 {
-            eprintln!("[WARN] Rofi exited with status code {}", rofi_entries_proc_exit_code);
-        }
-        return;
-    }
-    let mut rofi_entries_proc_stdout = rofi_entries_proc.stdout.expect("couldn't read stdout of child process");
-    let mut password_entry_name = String::new();
-    rofi_entries_proc_stdout.read_to_string(&mut password_entry_name).expect("couldn't read stdout of child process");
-    // Remove leading newline
-    password_entry_name.pop();
-
-    let mut rofi_copy_mode_proc = Command::new("/usr/bin/rofi")
-            .arg("-dmenu")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn child process");
-    let rofi_copy_mode_stdin = rofi_copy_mode_proc.stdin.as_mut().expect("couldn't write to stdin of child process");
-    rofi_copy_mode_stdin.write_all(b"Copy username\nCopy password").expect("couldn't write to stdin of child process");
-    let rofi_copy_mode_exit_code = rofi_copy_mode_proc.wait().expect("failed to spawn child process").code().expect("failed to acquire exit code");
-
-    if rofi_copy_mode_exit_code != 0 {
-        if rofi_copy_mode_exit_code != 1 {
-            eprintln!("[WARN] Rofi exited with status code {}", rofi_copy_mode_exit_code);
-        }
-        return;
-    }
-
-    let mut rofi_copy_mode_stdout = rofi_copy_mode_proc.stdout.expect("couldn't read stdout of child process");
-    let mut rofi_copy_mode_str = String::new();
-    rofi_copy_mode_stdout.read_to_string(&mut rofi_copy_mode_str).expect("couldn't read stdout of child process");
-
-    // Remove leading newline
-    rofi_copy_mode_str.pop();
-    let copy_mode = match &*rofi_copy_mode_str {
-        "Copy username" => CopyMode::Username,
-        "Copy password" => CopyMode::Password,
-        _ => unreachable!()
-    };
-
-    let mut keepassxc_info_proc = Command::new("/usr/bin/keepassxc-cli")
-            .arg("show")
-            .arg("--show-protected")
-            .arg(&*ARGS.database)
-            .arg(password_entry_name)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn child process");
-
-    let keepassxc_info_stdin = keepassxc_info_proc.stdin.as_mut().expect("couldn't write to stdin of child process");
-    keepassxc_info_stdin.write_all(passwd.as_bytes()).expect("couldn't write to stdin of child process");
-    let keepassxc_info_stdout = keepassxc_info_proc.stdout.as_mut().expect("couldn't read stdout of child process");
-    let mut keepassxc_entry_info = String::new();
-    keepassxc_info_stdout.read_to_string(&mut keepassxc_entry_info).expect("couldn't read stdout of child process");
-    // Remove leading newline
-    keepassxc_entry_info.pop();
-
-    let map = match parse_entry_info(&*keepassxc_entry_info) {
-        Some(map) => map,
-        None => {
-            eprintln!("[ERR] Failed to parse entry keepassxc info.");
             return;
         }
-    };
 
-    let value_to_copy = match copy_mode {
-        CopyMode::Username => map["UserName"],
-        CopyMode::Password => map["Password"],
-    };
+        let mut rofi_copy_mode_stdout = rofi_copy_mode_proc.stdout.expect("couldn't read stdout of child process");
+        let mut rofi_copy_mode_str = String::new();
+        rofi_copy_mode_stdout.read_to_string(&mut rofi_copy_mode_str).expect("couldn't read stdout of child process");
 
-    let mut ctx: clip::ClipboardContext = clip::ClipboardProvider::new().unwrap();
-    ctx.set_contents(value_to_copy.to_string()).unwrap();
-    register_clear_clipboard_alarm();
-    
-    /*let mut stdin = rofi_enter_passwd.stdin.take().expect("Failed to open stdin of child process.");
-    stdin.write_all(b"a\nb").expect("Failed to write to stdin of child process.");*/
+        // Remove leading newline
+        rofi_copy_mode_str.pop();
+        let sel = match &*rofi_copy_mode_str {
+            "Copy username" => EntryMenu::CopyUsername,
+            "Copy password" => EntryMenu::CopyPassword,
+            "Go back" => {
+                let mut fake_last_open_entry: Option<LastOpenEntry> = None;
+                open_entry_list_menu(key_data, &mut fake_last_open_entry, passwd);
+                *last_entry = fake_last_open_entry;
+                return;
+            }
+            _ => unreachable!()
+        };
+
+        copy_menu_selection_to_clipboard(entry_name, passwd, sel);
+        println!("return open_entry_menu");
+    }
+
+    fn copy_menu_selection_to_clipboard(entry_name: &str, passwd: &str, sel: EntryMenu) {
+        let mut keepassxc_info_proc = Command::new("/usr/bin/keepassxc-cli")
+                .arg("show")
+                .arg("--show-protected")
+                .arg(&*ARGS.database)
+                .arg(entry_name)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn child process");
+
+        let keepassxc_info_stdin = keepassxc_info_proc.stdin.as_mut().expect("couldn't write to stdin of child process");
+        keepassxc_info_stdin.write_all(passwd.as_bytes()).expect("couldn't write to stdin of child process");
+        let keepassxc_info_stdout = keepassxc_info_proc.stdout.as_mut().expect("couldn't read stdout of child process");
+        let mut keepassxc_entry_info = String::new();
+        keepassxc_info_stdout.read_to_string(&mut keepassxc_entry_info).expect("couldn't read stdout of child process");
+        // Remove leading newline
+        keepassxc_entry_info.pop();
+
+        let map = match parse_entry_info(&*keepassxc_entry_info) {
+            Some(map) => map,
+            None => {
+                eprintln!("[ERR] Failed to parse entry keepassxc info.");
+                return;
+            }
+        };
+
+        let value_to_copy = match sel {
+            EntryMenu::CopyUsername => map["UserName"],
+            EntryMenu::CopyPassword => map["Password"],
+        };
+
+        let mut ctx: clip::ClipboardContext = clip::ClipboardProvider::new().unwrap();
+        ctx.set_contents(value_to_copy.to_string()).unwrap();
+        register_clear_clipboard_alarm();
+    }
+
+    fn open_passwd_input_menu(key_data: &mut MasterKeyData, last_entry: &mut Option<LastOpenEntry>) {
+        println!("open_passwd_input_menu");
+       
+        let passwd = match &key_data.key {
+            Some(passwd) => {
+                key_data.last_use = Instant::now();
+                String::from(passwd.as_ref())
+            }
+            None => {
+                let rofi_enter_passwd = Command::new("/usr/bin/rofi")
+                    .arg("-dmenu")
+                    .arg("-password")
+                    .args(&["-p", "Password"])
+                    .output()
+                    .expect("failed to spawn child process");
+                let exit_code = rofi_enter_passwd
+                    .status
+                    .code()
+                    .expect("failed to acquire exit code.");
+
+                if exit_code != 0 {
+                    if exit_code != 1 {
+                        eprintln!("[WARN] Rofi exited with status code {}", exit_code);
+                    }
+                    return;
+                }
+
+                let str: &str = &*String::from_utf8_lossy(rofi_enter_passwd.stdout.as_slice());
+                key_data.last_use = Instant::now();
+                unsafe {
+                    key_data.key = Some(ProtectedBox::new_from_ref_copy(str));
+                    mem::forget(str);
+                }
+                String::from(str)
+            }
+        };
+
+        open_entry_list_menu(key_data, last_entry, &*passwd);
+        println!("return open_passwd_input_menu");
+    }
+
+    // TODO: Replace all panics with returns and log to stderr.
+    open_passwd_input_menu(key_data, last_entry);
 }
 
 extern "C" fn handle_clear_clipboard_(_: c_int) {
@@ -313,11 +353,12 @@ fn parse_entry_info<'a>(input: &'a str) -> Option<HashMap<&'a str, &'a str>> {
 fn recv_fifo(
     buf: &mut Vec<u8>,
     key_data: &mut MasterKeyData,
+    last_entry: &mut Option<LastOpenEntry>,
 ) {
     if buf[0] == PublicPacketHeader::OpenWindow as u8
         && buf.len() == PublicPacketHeader::OpenWindow.packet_len()
     {
-        run_rofi(key_data);
+        run_rofi(key_data, last_entry);
     } else {
         if buf.len() > 32 {
             eprintln!("Received unknown data")
@@ -375,6 +416,9 @@ struct Args {
     /// Timeout in seconds before master password is discarded
     #[arg(short, long, default_value_t = 30)]
     timeout: u64,
+    /// Timeout in seconds where the last opened entry will be automatically opened
+    #[arg(short, long, default_value_t = 20)]
+    open_last_timeout: u64,
     /// Password database path
     #[arg(short, long)]
     database: String,
@@ -387,6 +431,12 @@ lazy_static! {
 struct MasterKeyData {
     key: Option<ProtectedBox<str>>,
     last_use: Instant,
+}
+
+#[derive(Clone)]
+struct LastOpenEntry {
+    name: String,
+    time: Instant,
 }
 
 fn main() -> ExitCode {
@@ -402,6 +452,7 @@ fn main() -> ExitCode {
     register_fifo_delete_sigaction();
 
     let mut key_data = MasterKeyData { key: None, last_use: Instant::now() };
+    let mut last_entry: Option<LastOpenEntry> = None;
 
     let mut fifo = match open_fifo() {
         Some(f) => f,
@@ -461,6 +512,7 @@ fn main() -> ExitCode {
                                     recv_fifo(
                                         &mut fifo_packets,
                                         &mut key_data,
+                                        &mut last_entry,
                                     );
                                 } else {
                                     unreachable!()
